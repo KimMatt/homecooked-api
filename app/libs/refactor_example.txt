@@ -1,0 +1,151 @@
+// orders.js
+//
+// Author: Matthew Kim
+//
+
+//TODO RETURN REJECT AND RESOLVES
+
+var Orders = Object();
+var helper = require('./helper').helper;
+var Promise = require('bluebird');
+var pool = Promise.promisifyAll(require('../database/database').pool);
+var Menus = require('./menus').menus;
+var Users = require('./users').users;
+var Transactions = require('./transactions').transactions;
+
+Orders.addOrder = function(items, user_id, address_id) {
+
+	// recursive call for each order to be added
+	var recursive_orders = function(connection, index, items, oid) {
+		return new Promise(function(resolve, reject){
+			var execute_third = "insert into OrdersItems (order_id, item_id, name, quantity, owner_id) VALUES (?,?,?,?,?)";
+			var execute_fourth = "insert into OrdersOwners (order_id, owner_id) VALUES (?,?)";
+
+			// Finished
+			if(index >= items.length) {
+				connection.commit();
+				connection.release();
+				return resolve();
+			}
+			else {
+				var item = items[index];
+				var values = [oid, item.id, item.name, item.quantity, item.owner_id];
+				var values_fourth = [item.owner_id, oid];
+				console.log(execute_third);
+				console.log(values);
+				// Insert into order to item
+				connection.execute(execute_third, values, function(err, rows) {
+					if(err) {
+						connection.rollback();
+						return reject(err);
+					}
+					console.log(execute_fourth)
+					console.log(values_fourth)
+					// Insert into order to owner/menu
+					connection.execute(execute_fourth, values_fourth, function(err, rows) {
+						if(err) {
+							if(err.code == 'ER_DUP_ENTRY') {
+								return recursive_orders(connection, index + 1, items, oid, user_id).then(function(result) {
+									return resolve(result);
+								}).catch(function(err) {
+									return reject(err);
+								});
+							}
+							connection.rollback();
+							return reject(err);
+						}
+						return recursive_orders(connection, index + 1, items, oid, user_id).then(function(result) {
+								return resolve(result);
+							}).catch(function(err) {
+								return reject(err);
+							});
+					});
+				});
+			}
+		})
+	}
+
+	return new Promise(function(resolve, reject){
+
+		var execute = "insert into Orders (user_id, address_id) VALUES (?,?)";
+		var execute_third = "insert into OrdersUsers (user_id, order_id) VALUES(?,?)";
+
+		// Validate order and get charging price
+		const getItems = Menus.validateItems(items)
+		const getStripeTokens = Users.getStripeTokens(user_id)
+
+		/*
+			Promise.all([
+				getItems,
+				getStripeTokens,
+				pool.getConnectionAsync()
+			])
+			.then(function([price, stripe_info, connection]) {
+		*/
+		
+		Promise.all([
+			getItems,
+			getStripeTokens,
+			pool.getConnectionAsync()
+		])
+			.then(function([price, stripe_info, connection]) {
+				// REFACTOR
+				//const conn = Promise.promisifyAll(connection)
+				cost = price[0];
+				tax = price[0];
+
+				// Check if user has a credit card registered
+				// TODO add cash option
+
+				// Add orders to database
+				stripe_user_id = stripe_info.stripe_user_id;
+
+				connection.beginTransaction(function(err) {
+					if(err) {
+						return reject(err);
+					}
+					console.log(execute);
+					console.log([user_id, address_id]);
+					// Add base order item into database
+					connection.execute(execute, [user_id, address_id], function(err, order) {
+						if(err) {
+							connection.rollback();
+							return reject(err);
+						}
+						var oid = order.insertId
+						var values_third = [user_id, oid];
+						console.log("oid:" + oid)
+						console.log(execute_third)
+						console.log(values_third)
+						// Map the order to users
+						connection.execute(execute_third, values_third, function(err, rows) {
+							if(err) {
+								connection.rollback();
+								return reject(err);
+							}
+							// Begin recursively adding the items for each owner
+							// connection closed in recursive_orders
+							recursive_orders(connection, 0, items, oid).then(function(result) {
+								result.order_id = oid;
+								// Charge credit card
+								Transactions.charge(user_id, price, order_id, stripe_user_id).then(function(result) {
+									return resolve(result);
+								}).catch(function(err) {
+									return reject(err);
+								});
+							}).catch(function(err) {
+								return reject(err);
+							})
+						});
+					})
+				})
+			})
+			.catch(function(err) {
+				err.myMessage = "Invalid item id";
+				return reject(err);
+			});
+
+	});
+
+}
+
